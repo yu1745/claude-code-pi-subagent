@@ -18,7 +18,6 @@ export const SECTION_CHARS = 2100
 export const DETAIL_CHARS = 65536
 export const DETAIL_DEFAULT_LIMIT = 4096
 export const DETAIL_MAX_LIMIT = 8192
-export const RESULT_CHARS = 50000
 
 export type ActivityKind = 'user' | 'text' | 'tool' | 'result' | 'error' | 'retry' | 'note'
 
@@ -61,8 +60,14 @@ export const isReadOnlyType = (type: string) => READ_ONLY_TYPES.has(type.toLower
 
 // Starts pi in RPC mode reading its commands from `cmdFile` as lines are appended.
 // `exec` keeps the shell's pid for pi, so `tail --pid` ends with pi, and the pid
-// on stderr is what a stop kills.
-const WRAPPER = 'f="$1"; shift; echo "PI_PID $$" >&2; exec "$@" < <(exec tail -n +1 -f --pid=$$ "$f")'
+// on stderr is what a stop kills. While that pid lives a beat line goes to stderr
+// every BEAT_EVERY_S: pi is silent for as long as one command runs, and a stderr
+// line is what lets the agent's model request show the engine it is still working.
+export const BEAT_EVERY_S = 20
+const WRAPPER =
+  'f="$1"; shift; echo "PI_PID $$" >&2; ' +
+  `(n=0; while kill -0 $$ 2>/dev/null; do sleep 1; n=$((n+1)); if [ $((n % ${BEAT_EVERY_S})) -eq 0 ]; then echo PI_BEAT >&2; fi; done) >/dev/null & ` +
+  'exec "$@" < <(exec tail -n +1 -f --pid=$$ "$f")'
 
 export type PiRun = {
   cmdFile: string
@@ -84,13 +89,78 @@ export function piArgv({ cmdFile, session, readOnly, model, thinking }: PiRun): 
 export const KILL_TREE =
   'tree() { echo "$1"; for c in $(pgrep -P "$1"); do tree "$c"; done; }; kill $(tree "$1") 2>/dev/null; true'
 
-// pi's stderr less the wrapper's pid line and the new-session warning.
+// pi's stderr less the wrapper's pid and beat lines and the new-session warning.
 export function piStderr(stderr: string) {
   return stderr
     .split('\n')
-    .filter(l => !/^PI_PID \d+/.test(l) && !/^Warning: No project session found/.test(l))
+    .filter(l => !/^PI_PID \d+/.test(l) && l !== 'PI_BEAT' && !/^Warning: No project session found/.test(l))
     .join('\n')
 }
+
+// A stderr chunk split into the wrapper's beats and everything else.
+export function splitBeats(text: string): { beats: number; rest: string } {
+  let beats = 0
+  const rest = text.replace(/^PI_BEAT\r?\n/gm, () => (beats++, ''))
+  return { beats, rest }
+}
+
+export type Worktree = { path: string; head?: string; branch?: string }
+
+// `git worktree list --porcelain`, the main working tree first.
+export function parseWorktrees(porcelain: string): Worktree[] {
+  const out: Worktree[] = []
+  for (const line of porcelain.split('\n')) {
+    if (line.startsWith('worktree ')) out.push({ path: line.slice('worktree '.length) })
+    else if (line.startsWith('HEAD ') && out.length) out.at(-1)!.head = line.slice('HEAD '.length)
+    else if (line.startsWith('branch ') && out.length) out.at(-1)!.branch = line.slice('branch '.length).replace(/^refs\/heads\//, '')
+  }
+  return out
+}
+
+const baseName = (path: string) => path.replace(/\/+$/, '').split('/').at(-1) ?? ''
+
+// The worktree the engine made for an agent: `agent-<id>` on the branch `worktree-agent-<id>`.
+// It is never guessed at: no match, or two, is an error, so pi is not started in the wrong tree.
+export function findAgentWorktree(list: readonly Worktree[], agentId: string): { worktree: Worktree } | { error: string } {
+  const short = agentId.replace(/^a/, '').slice(0, 8)
+  const names = new Set([`agent-${agentId}`, `agent-a${short}`, `agent-${short}`])
+  const [, ...linked] = list
+  const found = linked.filter(w => names.has(baseName(w.path)) || [...names].some(n => w.branch === `worktree-${n}`))
+  if (found.length === 1) return { worktree: found[0]! }
+  const why = found.length ? `${found.length} worktrees match it` : `git worktree list has no worktree named agent-${agentId}`
+  return { error: `its isolated worktree was not found (${why}).` }
+}
+
+// What to do about a missing worktree: on a resume the engine has most likely removed it.
+export const missingWorktreeAdvice = (resumed: boolean) =>
+  resumed
+    ? 'The engine removes a worktree with no changes when the agent finishes, so start a new agent instead of resuming this one.'
+    : 'pi runs only in the worktree the engine made for this agent, never in another checkout; start the agent again.'
+
+export type WorktreeBrief = {
+  path: string
+  branch?: string
+  repo: string
+  head: string
+  // The session's HEAD, when the worktree could not be pointed at it.
+  sessionHead?: string
+}
+
+// What pi is told about the worktree it starts in.
+export function worktreePreface(w: WorktreeBrief) {
+  const lines = [
+    `You are working in an isolated git worktree: ${w.path}${w.branch ? ` (branch ${w.branch})` : ''}.`,
+    `It is at ${w.head}.`,
+    w.sessionHead
+      ? `The caller's checkout is at ${w.sessionHead}, which this worktree could not be pointed at; if the task depends on commits you cannot see, say so in your answer instead of working around it.`
+      : `That is the caller's checkout commit; uncommitted changes in the caller's checkout are not in this worktree.`,
+    `Stay inside ${w.path}: do not cd into or edit anything under ${w.repo}. If you change files, commit them on this branch when you are done, so the caller can merge them.`,
+  ]
+  return lines.join('\n')
+}
+
+// The last line of an answer from a worktree agent: where its work is.
+export const worktreeFooter = (w: { path: string; branch?: string }) => `[worktree · ${w.path}${w.branch ? ` · branch ${w.branch}` : ''}]`
 
 export const rpc = {
   prompt: (message: string) => JSON.stringify({ type: 'prompt', message }),
@@ -317,36 +387,6 @@ export function resolveAgent<T extends { id: string; name?: string }>(agents: It
 
 export const totalTokens = (u: Usage) => u.input + u.output + u.cacheRead + u.cacheWrite
 
-export function completionNotice(a: {
-  id: string
-  name?: string
-  description: string
-  status: string
-  stats: RunStats
-  durationMs: number
-  outputFile: string
-  worktree?: { path: string; branch: string }
-}) {
-  const lines = [
-    `<pi-subagent-notification>`,
-    `agentId: ${a.id}${a.name ? ` (name: ${a.name})` : ''}`,
-    `description: ${a.description}`,
-    `status: ${a.status}`,
-    `model: ${a.stats.model ?? 'unknown'}`,
-    `tool uses: ${a.stats.steps} · tokens: ${totalTokens(a.stats.usage)} · duration: ${Math.round(a.durationMs / 1000)}s`,
-    ...(a.worktree ? [`worktreePath: ${a.worktree.path}`, `worktreeBranch: ${a.worktree.branch}`] : []),
-    ...(a.stats.error ? [`error: ${a.stats.error}`] : []),
-    `transcript: ${a.outputFile}`,
-    a.status === 'completed' ? 'result:' : 'last answer (partial or none):',
-    cut(a.stats.answer || '(none)', RESULT_CHARS),
-    a.status === 'completed'
-      ? `SendMessage to ${a.name ?? a.id} continues this agent's session.`
-      : `SendMessage to ${a.name ?? a.id} resumes its session to retry or continue; Agent starts a fresh one.`,
-    `</pi-subagent-notification>`,
-  ]
-  return lines.join('\n')
-}
-
 export type ModelInfo = { id: string; context: string; maxOut: string; thinking: boolean; images: boolean }
 
 // Parses `pi --list-models`: provider, model (may hold spaces), context, max-out, thinking, images.
@@ -402,6 +442,24 @@ export function resolveScoped(requested: string, scoped: readonly ModelInfo[]): 
   }
 }
 
+// Whether a model pattern ends in `:<thinking>`; a `:` inside a model id (`x:free`) is not one.
+export function hasThinkingSuffix(model?: string) {
+  const colon = model?.lastIndexOf(':') ?? -1
+  return colon > 0 && THINKING_LEVELS.includes(model!.slice(colon + 1))
+}
+
+// `default` or `default:<thinking>` after the `@`: pi's current default model, not a named one.
+export function parseDefault(requested?: string): { level?: string } | { error: string } | undefined {
+  const [word, level, ...extra] = (requested ?? '').toLowerCase().split(':')
+  if (word !== 'default') return undefined
+  if (level === undefined) return {}
+  if (extra.length || !THINKING_LEVELS.includes(level)) return { error: `"${requested}" is not a thinking level of pi's default model; use @default or @default:<${THINKING_LEVELS.join('|')}>.` }
+  return { level }
+}
+
+export const DEFAULT_NOTE =
+  "`@default` (`general-purpose@default`, optionally `:<thinking>`) runs pi's current default model: use it unless the user names a model."
+
 export function scopedNote(scoped: readonly ModelInfo[], fallback: string) {
   const rows = scoped.map(
     m =>
@@ -410,6 +468,7 @@ export function scopedNote(scoped: readonly ModelInfo[], fallback: string) {
   return [
     `- Models: subagents run only on these scoped models (append \`@<provider>/<model>\` to subagent_type, optionally \`:<thinking>\`; any other model is refused; omitted, the default):`,
     ...rows,
+    `- ${DEFAULT_NOTE}${fallback ? ` It is ${fallback} now.` : ''}`,
   ].join('\n')
 }
 

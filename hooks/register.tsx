@@ -14,10 +14,16 @@ import {
   clampInterval,
   clip,
   detailPage,
+  DEFAULT_NOTE,
   dialogId,
   digest,
+  findAgentWorktree,
+  hasThinkingSuffix,
+  missingWorktreeAdvice,
   type ModelInfo,
+  parseDefault,
   parseModelList,
+  parseWorktrees,
   resolveScoped,
   scopeModels,
   scopedNote,
@@ -28,8 +34,11 @@ import {
   pushActivity,
   resolveAgent,
   rpc,
+  splitBeats,
   splitType,
   totalTokens,
+  worktreeFooter,
+  worktreePreface,
 
   piVersionNote,
   watchSection,
@@ -39,7 +48,9 @@ import {
 // worktree, TaskStop, resume): only its model requests are answered by pi.
 const AGENT_HEAD = `
 
-Subagents here think with pi on third-party models by default: the engine runs the agent as usual (tasks list, worktree, notification, resume), and its model is pi. A fork, a remote agent, or a call that sets the \`model\` parameter (sonnet, opus, haiku, fable) or appends \`@claude\` to subagent_type runs on Claude instead.`
+Subagents here think with pi on third-party models by default: the engine runs the agent as usual (tasks list, worktree, notification, resume), and its model is pi. A fork, a remote agent, or a call that sets the \`model\` parameter (sonnet, opus, haiku, fable) or appends \`@claude\` to subagent_type runs on Claude instead.
+
+An agent with \`isolation: "worktree"\` that pi runs gets its own git worktree. Before pi starts, the mod points it at the session's current HEAD commit (uncommitted changes in the main checkout are not in it), tells pi the worktree's path and to stay inside it, and ends the answer with the worktree's path and branch. A Claude-run agent's worktree is Claude Code's own, created from origin/main.`
 
 const AGENT_TAIL = `
 - \`effort\` sets pi's thinking level when the model carries no \`:<thinking>\`.
@@ -47,28 +58,40 @@ const AGENT_TAIL = `
 - Supervision (opt-in; third-party models can drift or stall): mcp__pi-subagent__subagent_activity reads its recent activity without consuming anything; mcp__pi-subagent__watch_subagent sends you periodic activity evidence while it works. Do not poll by default.`
 
 const ANY_MODEL_NOTE =
-  "- Model: append `@<provider>/<model>` to subagent_type (`general-purpose@codebuddy/glm-5.3`), optionally `:<thinking>`; omitted, pi's default. `pi --list-models <search>` in Bash lists models."
+  `- Model: append \`@<provider>/<model>\` to subagent_type (\`general-purpose@codebuddy/glm-5.3\`), optionally \`:<thinking>\`; omitted, pi's default. \`pi --list-models <search>\` in Bash lists models.\n- ${DEFAULT_NOTE}`
 
 // The models subagents may use: pi's scoped models (`enabledModels`, the project's
 // over the user's), with pi's own facts on each; none scoped, any model goes.
 type Scope = { models: ModelInfo[]; fallback?: string }
 let scope: Promise<Scope> | undefined
 
-async function readScope($: EngineInterface): Promise<Scope> {
+// pi's settings, the project's over the user's.
+async function readPiSettings($: EngineInterface) {
   const home = (await $.env.get('HOME')) ?? ''
   type PiSettings = { enabledModels?: string[]; defaultProvider?: string; defaultModel?: string }
   const readJson = async (path: string): Promise<PiSettings> =>
     (await $.fs.exists(path)) ? (JSON.parse(await $.fs.read(path)) as PiSettings) : {}
   const user = await readJson(`${home}/.pi/agent/settings.json`).catch((): PiSettings => ({}))
   const project = await readJson('.pi/settings.json').catch((): PiSettings => ({}))
-  const enabled = project.enabledModels?.length ? project.enabledModels : (user.enabledModels ?? [])
+  return {
+    enabled: project.enabledModels?.length ? project.enabledModels : (user.enabledModels ?? []),
+    provider: project.defaultProvider ?? user.defaultProvider,
+    name: project.defaultModel ?? user.defaultModel,
+  }
+}
+
+// pi's default model among the scoped ones; the first scoped one when pi names none of them.
+function defaultOf(models: readonly ModelInfo[], provider?: string, name?: string) {
+  const preferred = provider && name ? resolveScoped(`${provider}/${name}`, models) : undefined
+  return preferred && 'model' in preferred ? preferred.model : models[0]?.id
+}
+
+async function readScope($: EngineInterface): Promise<Scope> {
+  const { enabled, provider, name } = await readPiSettings($)
   if (!enabled.length) return { models: [] }
   const listed = await $.process.run(['pi', '--list-models'], { timeoutMs: 120_000 }).then(r => parseModelList(r.stdout), () => [])
   const models = scopeModels(enabled, listed)
-  const provider = project.defaultProvider ?? user.defaultProvider
-  const name = project.defaultModel ?? user.defaultModel
-  const preferred = provider && name ? resolveScoped(`${provider}/${name}`, models) : undefined
-  return { models, fallback: preferred && 'model' in preferred ? preferred.model : models[0]?.id }
+  return { models, fallback: defaultOf(models, provider, name) }
 }
 
 const ACTIVITY_TOOL = 'mcp__pi-subagent__subagent_activity'
@@ -97,6 +120,11 @@ type Kept = {
   thinking?: string
   readOnly: boolean
   isolated: boolean
+  // The caller's checkout, read where the Agent call was made: what an isolated
+  // agent's worktree is pointed at and pi is told to keep out of.
+  repo?: string
+  // The commit its worktree was pointed at: set once pi has started in it.
+  based?: string
 }
 
 type Agent = Kept & {
@@ -106,6 +134,11 @@ type Agent = Kept & {
   pid?: string
   cmdFile?: string
   lastTool?: string
+  worktree?: { path: string; branch?: string }
+  // This run could not start pi (no worktree): retrying in the same session does not help.
+  notStarted?: boolean
+  // This run yielded a beat, so its answer's text is block 1, not 0.
+  beaten?: boolean
   events: Activity[]
   seq: number
   stats: RunStats
@@ -159,6 +192,8 @@ async function keep($: EngineInterface, a: Agent) {
     thinking: a.thinking,
     readOnly: a.readOnly,
     isolated: a.isolated,
+    repo: a.repo,
+    based: a.based,
   }
   await $.store.set(`agent:${a.id}`, kept)
 }
@@ -174,17 +209,45 @@ async function findKept($: EngineInterface, id: string): Promise<Agent | undefin
   return a
 }
 
-// The agent's working directory: its own worktree when the engine isolated it.
-async function agentCwd($: EngineInterface, a: Agent) {
-  const cwd = (await $.process.run(['pwd'])).stdout.trim()
-  if (!a.isolated) return cwd
-  const listed = await $.process.run(['git', 'worktree', 'list', '--porcelain'], { cwd })
-  const paths = listed.stdout
-    .split('\n')
-    .filter(l => l.startsWith('worktree '))
-    .map(l => l.slice('worktree '.length))
-  const short = a.id.replace(/^a/, '').slice(0, 8)
-  return paths.find(p => p.includes(a.id)) ?? paths.find(p => p.includes(short)) ?? cwd
+// Where pi starts: the agent's directory, or for an isolated agent its own worktree.
+// On its first run the worktree is pointed at the session's HEAD (the engine makes it
+// from origin/main), when nothing in it could be lost. A worktree that cannot be found
+// is an error: pi never falls back to another checkout.
+async function enterWorktree($: EngineInterface, a: Agent): Promise<{ cwd: string; preface?: string } | { error: string }> {
+  // Found again on every run: a worktree of an earlier run may be gone by now.
+  a.worktree = undefined
+  if (!a.isolated) return { cwd: (await $.process.run(['pwd'])).stdout.trim() }
+  // The checkout the Agent call was made from. Which root `$.session.root()` answers
+  // inside the agent's own hook is not documented, so it is only the fallback for
+  // an agent kept before the call recorded it.
+  const session = a.repo ?? (await $.session.root())
+  const git = async (cwd: string, ...args: string[]) => {
+    const r = await $.process.run(['git', ...args], { cwd, timeoutMs: 120_000 })
+    return { ok: r.exitCode === 0, out: r.stdout.trim() }
+  }
+  const listed = await git(session, 'worktree', 'list', '--porcelain')
+  if (!listed.ok) return { error: `its isolated worktree could not be listed (git worktree list failed in ${session})` }
+  const trees = parseWorktrees(listed.out)
+  const found = findAgentWorktree(trees, a.id)
+  if ('error' in found) return { error: `${found.error} ${missingWorktreeAdvice(Boolean(a.based))}` }
+  const { path, branch } = found.worktree
+  a.worktree = { path, branch }
+  if (a.based) return { cwd: path }
+
+  const sessionHead = (await git(session, 'rev-parse', 'HEAD')).out
+  let head = (await git(path, 'rev-parse', 'HEAD')).out
+  if (!head) return { error: `its isolated worktree ${path} is not a git checkout` }
+  let behind: string | undefined
+  if (sessionHead && sessionHead !== head) {
+    const status = await git(path, 'status', '--porcelain')
+    const clean = status.ok && status.out === ''
+    if (clean && (await git(path, 'reset', '--hard', sessionHead)).ok) head = sessionHead
+    else behind = sessionHead
+  }
+  const subject = (await git(path, 'log', '-1', '--format=%h %s')).out
+  a.based = head
+  await keep($, a)
+  return { cwd: path, preface: worktreePreface({ path, branch, repo: session, head: subject || head, sessionHead: behind }) }
 }
 
 // Watch notices go to the main agent as one prompt once it is idle; each
@@ -285,25 +348,73 @@ function mirror($: EngineInterface, a: Agent, items: Omit<Activity, 'seq' | 'at'
   }
 }
 
+// A piece of "thinking" with nothing in it: the engine shows it and does not record it,
+// and it counts as progress of the agent's model request, whose stream watchdog stops an
+// agent after 600 s of nothing. pi runs a long command in silence, so pi's output alone
+// is not enough to keep it alive.
+const BEAT = { kind: 'thinking' as const, index: 0, text: '' }
+const BEAT_MIN_MS = 5_000
+
 // Runs one pi turn for the agent: a fresh pi session on its first, the same one after.
-async function runPi($: EngineInterface, a: Agent, message: string, signal: AbortSignal) {
-  const dir = await subagentDir($)
-  const sessionFile = (await $.fs.list(dir).catch(() => [])).find(f => f.name.endsWith(`_${a.id}.jsonl`))
-  const session = sessionFile ? ['--session', `${dir}/${sessionFile.name}`] : ['--session-dir', dir, '--session-id', a.id]
-  a.cmdFile = `${dir}/${a.id}.cmd.jsonl`
+// It yields BEAT while pi shows signs of life, so a long run is not taken for a stall.
+async function* runPi($: EngineInterface, a: Agent, message: string, signal: AbortSignal): AsyncGenerator<typeof BEAT, number> {
   a.status = 'running'
   a.pid = undefined
   a.lastTool = undefined
   a.stats = newStats()
   a.runStartedAt = Date.now()
-  if (sessionFile) a.seq = pushActivity(a.events, a.seq, a.runStartedAt, [{ kind: 'note', summary: 'resumed its pi session', detail: '' }])
-  await $.fs.write(a.cmdFile, rpc.prompt(message) + '\n')
+  a.beaten = false
+  a.notStarted = false
   showStatus($)
   publish($, a)
 
+  const fail = (error: string) => {
+    a.stats.error = error
+    const items = [{ kind: 'error' as const, summary: clip(error, 240), detail: error }]
+    a.seq = pushActivity(a.events, a.seq, Date.now(), items)
+    mirror($, a, items)
+  }
+  let beats = 0
+  // Left at a yield (the engine closed the stream), the run never reaches its end:
+  // the agent is then stopped, not left "running" with its watch ticking.
+  let closed = true
+  try {
+    const entered = await enterWorktree($, a)
+    if ('error' in entered) {
+      a.notStarted = true
+      fail(`pi was not started: ${entered.error}`)
+    } else {
+      beats = yield* runChild($, a, entered.preface ? `${entered.preface}\n\n${message}` : message, entered.cwd, signal)
+    }
+    closed = false
+  } catch (err) {
+    closed = false
+    if (!a.stats.error) fail(`pi could not be run: ${(err as Error).message}`)
+  } finally {
+    const stopped = closed || signal.aborted || a.stats.aborted
+    if (!stopped && !a.stats.error && !a.stats.answer) a.stats.error = 'pi ended without an answer'
+    a.status = stopped ? 'stopped' : a.stats.error ? 'failed' : 'completed'
+    a.lastTool = undefined
+    a.pid = undefined
+    stopWatch(a)
+    showStatus($)
+    publish($, a)
+  }
+  return beats
+}
+
+// Runs pi in `cwd` until it settles; returns how many beats it yielded.
+async function* runChild($: EngineInterface, a: Agent, message: string, cwd: string, signal: AbortSignal): AsyncGenerator<typeof BEAT, number> {
+  const dir = await subagentDir($)
+  const sessionFile = (await $.fs.list(dir).catch(() => [])).find(f => f.name.endsWith(`_${a.id}.jsonl`))
+  const session = sessionFile ? ['--session', `${dir}/${sessionFile.name}`] : ['--session-dir', dir, '--session-id', a.id]
+  a.cmdFile = `${dir}/${a.id}.cmd.jsonl`
+  if (sessionFile) a.seq = pushActivity(a.events, a.seq, a.runStartedAt, [{ kind: 'note', summary: 'resumed its pi session', detail: '' }])
+  await $.fs.write(a.cmdFile, rpc.prompt(message) + '\n')
+
   const child = $.process.spawn({
     argv: piArgv({ cmdFile: a.cmdFile, session, readOnly: a.readOnly, model: a.model, thinking: a.thinking }),
-    cwd: await agentCwd($, a),
+    cwd,
   })
   const kill = () => {
     if (a.pid) void $.process.run(['bash', '-c', KILL_TREE, 'pi-subagent', a.pid])
@@ -311,13 +422,39 @@ async function runPi($: EngineInterface, a: Agent, message: string, signal: Abor
   signal.addEventListener('abort', kill, { once: true })
   let pending = ''
   let stderr = ''
+  // Tools pi has started and not finished: while one runs, pi's silence is the command's.
+  let open = 0
+  // pi's own output can be a burst of lines; the wrapper's beats are already 20 s apart.
+  let yielded = 0
+  let lastBeat = 0
+  // Once stopped, nothing is yielded: the engine may have stopped reading, and the run
+  // must still reach its end.
+  const due = () => {
+    const now = Date.now()
+    if (signal.aborted || now - lastBeat < BEAT_MIN_MS) return false
+    lastBeat = now
+    return true
+  }
+  // Whether the loop ran to pi's end (or its settling); otherwise pi's tree is killed.
+  let drained = false
   try {
     for await (const { stream, text } of child) {
       if (stream === 'stderr') {
-        stderr = (stderr + text).slice(-8000)
+        const { beats, rest } = splitBeats(text)
+        stderr = (stderr + rest).slice(-8000)
         a.pid ??= /PI_PID (\d+)/.exec(stderr)?.[1]
         if (signal.aborted) kill()
+        if (beats && open > 0 && !signal.aborted) {
+          yielded += 1
+          a.beaten = true
+          yield BEAT
+        }
         continue
+      }
+      if (due()) {
+        yielded += 1
+        a.beaten = true
+        yield BEAT
       }
       pending += text
       const lines = pending.split('\n')
@@ -341,16 +478,23 @@ async function runPi($: EngineInterface, a: Agent, message: string, signal: Abor
         a.seq = pushActivity(a.events, a.seq, Date.now(), items)
         mirror($, a, items)
         if (ev.type === 'tool_execution_start') {
+          open += 1
           a.lastTool = clip(String(ev.toolName), 24)
           showStatus($)
-        }
+        } else if (ev.type === 'tool_execution_end') open = Math.max(0, open - 1)
+        // A turn ends once its tools have: one whose end never came (a nested call that
+        // threw) must not keep beating for a model that has gone silent since.
+        else if ((ev.type === 'turn_end' || ev.type === 'agent_end') && !ev.parentToolCallId) open = 0
       }
       if (a.stats.settled) break
     }
+    drained = true
   } catch (err) {
     a.stats.error ??= `pi could not run: ${(err as Error).message}`
   } finally {
     signal.removeEventListener('abort', kill)
+    // Leaving the loop early ends only pi itself; the commands it runs go with the tree.
+    if (!drained) kill()
   }
   let code: number | null = null
   if (!a.stats.settled) code = await child.result.then(r => r.code, () => null)
@@ -361,23 +505,19 @@ async function runPi($: EngineInterface, a: Agent, message: string, signal: Abor
     a.seq = pushActivity(a.events, a.seq, Date.now(), items)
     mirror($, a, items)
   }
-  if (!stopped && !a.stats.error && !a.stats.answer) a.stats.error = 'pi ended without an answer'
-  a.status = stopped ? 'stopped' : a.stats.error ? 'failed' : 'completed'
-  a.lastTool = undefined
-  a.pid = undefined
-  stopWatch(a)
-  showStatus($)
-  publish($, a)
+  return yielded
 }
 
 function answerOf(a: Agent) {
+  const foot = a.worktree ? `\n${worktreeFooter(a.worktree)}` : ''
   const head = `[pi · ${a.stats.model ?? a.model ?? "pi's default model"} · ${a.stats.steps} tool uses]`
   if (a.status === 'failed') {
-    return `${head}\npi failed: ${a.stats.error}${a.stats.answer ? `\n\nLast answer before it failed:\n${a.stats.answer}` : ''}\n\nSendMessage to this agent retries in the same pi session.`
+    const retry = a.notStarted ? '' : '\n\nSendMessage to this agent retries in the same pi session.'
+    return `${head}\npi failed: ${a.stats.error}${a.stats.answer ? `\n\nLast answer before it failed:\n${a.stats.answer}` : ''}${retry}${foot}`
   }
-  if (a.status === 'stopped') return `${head}\npi was stopped.${a.stats.answer ? `\n\nLast answer:\n${a.stats.answer}` : ''}`
+  if (a.status === 'stopped') return `${head}\npi was stopped.${a.stats.answer ? `\n\nLast answer:\n${a.stats.answer}` : ''}${foot}`
   const u = a.stats.usage
-  return `${a.stats.answer}\n\n[pi · ${a.stats.model ?? 'model unknown'} · ${a.stats.steps} tool uses · ${totalTokens(u)} tokens: ${u.input} in, ${u.output} out, ${u.cacheRead} cache read]`
+  return `${a.stats.answer}\n\n[pi · ${a.stats.model ?? 'model unknown'} · ${a.stats.steps} tool uses · ${totalTokens(u)} tokens: ${u.input} in, ${u.output} out, ${u.cacheRead} cache read]${foot}`
 }
 
 function piUsage(a: Agent) {
@@ -472,13 +612,20 @@ export const register: Register = on => {
     }
     scope ??= readScope($)
     const { models, fallback } = await scope
-    let model = requested
+    // `@default`, like no `@` at all, is pi's default model as it is now, not as the session began.
+    const asDefault = parseDefault(requested)
+    if (asDefault && 'error' in asDefault) return { deny: asDefault.error }
+    let model = asDefault ? undefined : requested
     if (models.length) {
-      const resolved = requested ? resolveScoped(requested, models) : fallback ? { model: fallback } : undefined
+      const now = await readPiSettings($).then(s => defaultOf(models, s.provider, s.name), () => undefined)
+      const named = model ? resolveScoped(model, models) : undefined
+      const resolved = named ?? ((now ?? fallback) ? { model: (now ?? fallback)! } : undefined)
       if (resolved && 'error' in resolved) return { deny: resolved.error }
       model = resolved?.model
     }
-    const thinking = model?.includes(':') || !e.effort || !THINKING_LEVELS.includes(e.effort) ? undefined : e.effort
+    // A level written after the model name wins over `effort`; a default model carries none of its own.
+    const effort = asDefault?.level ?? e.effort
+    const thinking = (!asDefault && hasThinkingSuffix(model)) || !effort || !THINKING_LEVELS.includes(effort) ? undefined : effort
     asked.set(e.tool_use_id, {
       name: e.name,
       type,
@@ -486,6 +633,8 @@ export const register: Register = on => {
       thinking,
       readOnly: isReadOnlyType(type),
       isolated: e.isolation === 'worktree',
+      // Read here, in the caller's own hook, where the session's root is the caller's.
+      repo: e.isolation === 'worktree' ? await $.session.root() : undefined,
     })
     try {
       return await next({ ...e, subagent_type: type })
@@ -520,8 +669,10 @@ export const register: Register = on => {
   // What the engine hands the agent to read (its prompt, a resume's message) is pi's next input.
   on('session.append', async ($, e, next) => {
     const stored = await next(e)
-    const a = e.agentId ? agents.get(e.agentId) : undefined
-    if (a && !stored.deny && e.message.type === 'user' && e.message.role === 'user' && e.door !== 'tool-result' && e.door !== 'note') {
+    const toAgent = e.agentId && !stored.deny && e.message.type === 'user' && e.message.role === 'user' && e.door !== 'tool-result' && e.door !== 'note'
+    // A resume after a reload appends its message before the agent's step loads it from the store.
+    const a = toAgent ? await findKept($, e.agentId!) : undefined
+    if (a) {
       const text = textOf(e.message.content as { type: string; text?: string }[])
       if (text) a.inbox.push(text)
     }
@@ -552,15 +703,17 @@ export const register: Register = on => {
     if (!a) return yield* next(e)
     // pi echoes the message as its own user row, which the activity records.
     const message = a.inbox.splice(0).join('\n\n') || 'Continue.'
-    await runPi($, a, message, next.signal)
+    const beats = yield* runPi($, a, message, next.signal)
     const answer = answerOf(a) || '(pi gave no text)'
-    yield { kind: 'text', index: 0, text: answer }
+    // The answer is the block after the beats' (one block holds one kind of piece).
+    yield { kind: 'text', index: beats ? BEAT.index + 1 : 0, text: answer }
     return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: piUsage(a) }
   }).catch(async function* ($, e, next) {
     // A pi-backed agent never falls back to a Claude request.
     if (!e.agentId || !agents.has(e.agentId)) return yield* next(e)
     const answer = `pi-subagent failed: ${String(next.error?.message ?? 'unknown error')}`
-    yield { kind: 'text', index: 0, text: answer }
+    // The failed hook's beats stay in the response, in block 0.
+    yield { kind: 'text', index: agents.get(e.agentId)?.beaten ? BEAT.index + 1 : 0, text: answer }
     return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
   })
 

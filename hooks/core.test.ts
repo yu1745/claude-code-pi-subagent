@@ -6,24 +6,31 @@ import {
   activityPage,
   clampInterval,
   clip,
-  completionNotice,
   detailPage,
   dialogId,
   digest,
+  findAgentWorktree,
+  hasThinkingSuffix,
   isReadOnlyType,
+  missingWorktreeAdvice,
   newStats,
   piArgv,
+  parseDefault,
   parseModelList,
   resolveScoped,
   scopeModels,
   scopedNote,
+  parseWorktrees,
   piStderr,
   piVersionNote,
   pushActivity,
   resolveAgent,
   rpc,
+  splitBeats,
   splitType,
   watchSection,
+  worktreeFooter,
+  worktreePreface,
 } from './core'
 
 test('splitType: type, model and thinking suffix', () => {
@@ -71,7 +78,7 @@ test('dialogId: only blocking dialogs', () => {
   expect(dialogId({ type: 'response', id: 'q', method: 'confirm' })).toBeUndefined()
 })
 
-test('piStderr drops the wrapper pid and the new-session warning', () => {
+test('piStderr drops the wrapper pid and beat lines and the new-session warning', () => {
   const raw = "PI_PID 42\nWarning: No project session found with id 'x'; creating a new session with that id.\nError: Model \"m\" not found."
   expect(piStderr(raw)).toBe('Error: Model "m" not found.')
 })
@@ -247,29 +254,6 @@ test('resolveAgent: id, name, prefix, ambiguous, short, missing', () => {
   expect(resolveAgent(list, 'pi-nothing-here').error).toContain('No pi subagent')
 })
 
-test('completionNotice: completed, failed with worktree, long result cut', () => {
-  const s = newStats()
-  s.answer = 'done'
-  s.model = 'p/m'
-  s.steps = 2
-  s.usage.input = 5
-  const ok = completionNotice({ id: 'pi-1', name: 'n', description: 'd', status: 'completed', stats: s, durationMs: 4000, outputFile: '/o' })
-  expect(ok).toContain('agentId: pi-1 (name: n)')
-  expect(ok).toContain('status: completed')
-  expect(ok).toContain('result:\ndone')
-  expect(ok).toContain('tool uses: 2 · tokens: 5 · duration: 4s')
-  expect(ok).toContain('SendMessage to n continues')
-  expect(ok).not.toContain('worktreePath')
-  const f = newStats()
-  f.error = 'boom'
-  f.answer = 'x'.repeat(60000)
-  const bad = completionNotice({ id: 'pi-2', description: 'd', status: 'failed', stats: f, durationMs: 0, outputFile: '/o', worktree: { path: '/w', branch: 'b' } })
-  expect(bad).toContain('error: boom')
-  expect(bad).toContain('worktreePath: /w\nworktreeBranch: b')
-  expect(bad).toContain('more characters')
-  expect(bad).toContain('SendMessage to pi-2 resumes')
-})
-
 const LIST = `provider                 model                                               context  max-out  thinking  images
 codebuddy                deepseek-v4.1-flash (x0.11)                         1M       128K     yes       yes
 openrouter               deepseek/deepseek-v4.1-flash:batch                  1.0M     384K     yes       yes
@@ -321,4 +305,95 @@ test('piVersionNote: tested, other version, missing', () => {
   expect(piVersionNote('1.3.0')).toContain('found 1.3.0')
   expect(piVersionNote('1.20.0')).toContain('found 1.20.0')
   expect(piVersionNote(undefined)).toContain('not on PATH')
+})
+
+test('splitBeats takes the wrapper beats out of a stderr chunk', () => {
+  expect(splitBeats('PI_BEAT\nPI_BEAT\n')).toEqual({ beats: 2, rest: '' })
+  expect(splitBeats('PI_PID 7\nPI_BEAT\nwarn\n')).toEqual({ beats: 1, rest: 'PI_PID 7\nwarn\n' })
+  expect(splitBeats('not PI_BEAT\n')).toEqual({ beats: 0, rest: 'not PI_BEAT\n' })
+  expect(piStderr('PI_PID 7\nPI_BEAT\nreal error')).toBe('real error')
+})
+
+test('the wrapper beats while pi lives and stays out of its stdout', () => {
+  const wrapper = piArgv({ cmdFile: '/c', session: [], readOnly: false })[2] ?? ''
+  expect(wrapper).toContain('echo PI_BEAT >&2')
+  expect(wrapper).toContain('kill -0 $$')
+  expect(wrapper).toContain('>/dev/null &')
+  expect(wrapper).toContain('exec "$@"')
+})
+
+const PORCELAIN = `worktree /repo
+HEAD aaa
+branch refs/heads/main
+
+worktree /repo/.claude/worktrees/agent-a3c15e4c0870736b3
+HEAD bbb
+branch refs/heads/worktree-agent-a3c15e4c0870736b3
+
+worktree /tmp/taskc-verify
+HEAD ccc
+detached
+`
+
+test('parseWorktrees: path, head and branch, main tree first', () => {
+  expect(parseWorktrees(PORCELAIN)).toEqual([
+    { path: '/repo', head: 'aaa', branch: 'main' },
+    { path: '/repo/.claude/worktrees/agent-a3c15e4c0870736b3', head: 'bbb', branch: 'worktree-agent-a3c15e4c0870736b3' },
+    { path: '/tmp/taskc-verify', head: 'ccc' },
+  ])
+  expect(parseWorktrees('')).toEqual([])
+})
+
+test('findAgentWorktree: exact name or branch only, never the main tree, never a guess', () => {
+  const list = parseWorktrees(PORCELAIN)
+  expect(findAgentWorktree(list, 'a3c15e4c0870736b3')).toEqual({ worktree: list[1] })
+  // The engine's older short spelling.
+  const short = [{ path: '/repo' }, { path: '/repo/.claude/worktrees/agent-3c15e4c0' }]
+  expect(findAgentWorktree(short, 'a3c15e4c0870736b3')).toEqual({ worktree: short[1] })
+  // A hand-made worktree that merely mentions the id is not it.
+  const lookalike = [{ path: '/repo' }, { path: '/tmp/a3c15e4c0870736b3-verify' }, { path: '/tmp/taskc-verify' }]
+  expect(findAgentWorktree(lookalike, 'a3c15e4c0870736b3')).toHaveProperty('error')
+  // The main tree is not a candidate even when its own name matches.
+  expect(findAgentWorktree([{ path: '/work/agent-a1' }], 'a1')).toHaveProperty('error')
+  const twice = [{ path: '/repo' }, { path: '/x/agent-a1' }, { path: '/y/agent-a1' }]
+  const e = findAgentWorktree(twice, 'a1')
+  expect('error' in e && e.error).toContain('2 worktrees match')
+  const none = findAgentWorktree([{ path: '/repo' }], 'a1')
+  expect('error' in none && none.error).toContain('no worktree named agent-a1')
+})
+
+test('worktreePreface and worktreeFooter', () => {
+  const w = { path: '/r/.claude/worktrees/agent-a1', branch: 'worktree-agent-a1', repo: '/r', head: 'abc1234 subject' }
+  const ok = worktreePreface(w)
+  expect(ok).toContain('/r/.claude/worktrees/agent-a1 (branch worktree-agent-a1)')
+  expect(ok).toContain('It is at abc1234 subject.')
+  expect(ok).toContain('uncommitted changes in the caller')
+  expect(ok).toContain('do not cd into or edit anything under /r')
+  expect(worktreePreface({ ...w, sessionHead: 'def5678' })).toContain("caller's checkout is at def5678, which this worktree could not be pointed at")
+  expect(worktreeFooter(w)).toBe('[worktree · /r/.claude/worktrees/agent-a1 · branch worktree-agent-a1]')
+  expect(worktreeFooter({ path: '/w' })).toBe('[worktree · /w]')
+})
+
+test('parseDefault: @default and @default:<thinking>, nothing else', () => {
+  expect(parseDefault('default')).toEqual({})
+  expect(parseDefault('Default:HIGH')).toEqual({ level: 'high' })
+  expect(parseDefault('default:loud')).toHaveProperty('error')
+  expect(parseDefault('default:high:x')).toHaveProperty('error')
+  expect(parseDefault('codebuddy/default')).toBeUndefined()
+  expect(parseDefault('defaults')).toBeUndefined()
+  expect(parseDefault(undefined)).toBeUndefined()
+})
+
+test('hasThinkingSuffix: a trailing level only', () => {
+  expect(hasThinkingSuffix('codebuddy/glm-5.3:high')).toBe(true)
+  expect(hasThinkingSuffix('openrouter/deepseek/deepseek-v4.1-flash:batch')).toBe(false)
+  expect(hasThinkingSuffix('openrouter/x:free:low')).toBe(true)
+  expect(hasThinkingSuffix(':high')).toBe(false)
+  expect(hasThinkingSuffix('glm-5.3')).toBe(false)
+  expect(hasThinkingSuffix(undefined)).toBe(false)
+})
+
+test('missingWorktreeAdvice: a resume is told to start afresh, a first run that pi never strays', () => {
+  expect(missingWorktreeAdvice(true)).toContain('start a new agent instead of resuming')
+  expect(missingWorktreeAdvice(false)).toContain('never in another checkout')
 })
