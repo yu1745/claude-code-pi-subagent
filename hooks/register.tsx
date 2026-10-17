@@ -209,6 +209,20 @@ async function findKept($: EngineInterface, id: string): Promise<Agent | undefin
   return a
 }
 
+// The checkout the caller is working in now: the git toplevel of its live working
+// directory, which follows a `cd` into another repo; `$.session.root()` stays the
+// directory the session started in and is only the fallback.
+async function callerRepo($: EngineInterface): Promise<string> {
+  try {
+    const wd = (await $.process.run(['pwd'])).stdout.trim()
+    if (wd) {
+      const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: wd })
+      if (top.exitCode === 0 && top.stdout.trim()) return top.stdout.trim()
+    }
+  } catch {}
+  return await $.session.root()
+}
+
 // Where pi starts: the agent's directory, or for an isolated agent its own worktree.
 // On its first run the worktree is pointed at the session's HEAD (the engine makes it
 // from origin/main), when nothing in it could be lost. A worktree that cannot be found
@@ -634,7 +648,7 @@ export const register: Register = on => {
       readOnly: isReadOnlyType(type),
       isolated: e.isolation === 'worktree',
       // Read here, in the caller's own hook, where the session's root is the caller's.
-      repo: e.isolation === 'worktree' ? await $.session.root() : undefined,
+      repo: e.isolation === 'worktree' ? await callerRepo($) : undefined,
     })
     try {
       return await next({ ...e, subagent_type: type })
