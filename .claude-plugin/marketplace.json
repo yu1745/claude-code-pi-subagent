@@ -1,0 +1,6 @@
+{
+  "name": "claude-code-pi-subagent",
+  "description": "Claude Code mod: native subagents that think with pi on third-party models",
+  "owner": { "name": "yu1745" },
+  "plugins": [{ "name": "pi-subagent", "source": "./" }]
+}
