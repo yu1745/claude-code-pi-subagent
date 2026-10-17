@@ -1,4 +1,6 @@
+import { update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
+import type { Live } from '../types'
 import {
   type Activity,
   type RunStats,
@@ -72,6 +74,16 @@ async function readScope($: EngineInterface): Promise<Scope> {
 const ACTIVITY_TOOL = 'mcp__pi-subagent__subagent_activity'
 const WATCH_TOOL = 'mcp__pi-subagent__watch_subagent'
 const WATCH_TAG = '<pi-subagent-watch>'
+const LIVE = { plugin: 'pi-subagent', key: 'live' } as const
+const LIVE_LINES = 40
+const LIVE_MARK: Record<string, { mark: string; color: string }> = {
+  tool: { mark: '⏺', color: 'suggestion' },
+  result: { mark: '⎿', color: 'subtle' },
+  text: { mark: '◆', color: 'claude' },
+  error: { mark: '✗', color: 'error' },
+  retry: { mark: '↻', color: 'warning' },
+  note: { mark: '·', color: 'subtle' },
+}
 
 type Watch = { intervalS: number; brief?: string; criteria?: string; cursor: number; timer: { cancel: () => void } }
 
@@ -100,6 +112,9 @@ type Agent = Kept & {
   // User rows the engine appended to the agent's conversation since its last step.
   inbox: string[]
   watch?: Watch
+  // A band write in flight, and whether another is owed after it.
+  publishing?: boolean
+  republish?: boolean
 }
 
 // What an Agent call asked for, until its spawn names the agent.
@@ -227,8 +242,40 @@ function tick($: EngineInterface, a: Agent) {
   void flush($)
 }
 
-// Shows pi's work in the subagent's own transcript, as notices the model never reads.
+function liveOf(a: Agent): Live {
+  return {
+    label: `${a.name ? `${a.name} · ` : ''}${a.type}: ${a.description}`,
+    status: a.status,
+    model: a.stats.model ?? a.model,
+    steps: a.stats.steps,
+    lines: a.events
+      .filter(x => x.kind !== 'user')
+      .slice(-LIVE_LINES)
+      .map(x => ({ seq: x.seq, kind: x.kind, text: x.summary })),
+  }
+}
+
+// Writes the agent's latest activity for the band; one write at a time, the
+// last one taking whatever arrived while the one before was in flight.
+function publish($: EngineInterface, a: Agent) {
+  if (a.publishing) {
+    a.republish = true
+    return
+  }
+  a.publishing = true
+  a.republish = false
+  void update($, { ...LIVE, id: a.id }, () => liveOf(a))
+    .catch(() => undefined)
+    .finally(() => {
+      a.publishing = false
+      if (a.republish) publish($, a)
+    })
+}
+
+// Shows pi's work in the subagent's own transcript, as notices the model never
+// reads (ctrl+o draws them, dim), and in the band while that transcript is open.
 function mirror($: EngineInterface, a: Agent, items: Omit<Activity, 'seq' | 'at'>[]) {
+  if (items.some(item => item.kind !== 'user')) publish($, a)
   for (const item of items) {
     if (item.kind === 'user') continue
     const mark = item.kind === 'tool' ? '⏺' : item.kind === 'error' ? '✗' : item.kind === 'retry' ? '↻' : item.kind === 'text' ? '◆' : '⎿'
@@ -252,6 +299,7 @@ async function runPi($: EngineInterface, a: Agent, message: string, signal: Abor
   if (sessionFile) a.seq = pushActivity(a.events, a.seq, a.runStartedAt, [{ kind: 'note', summary: 'resumed its pi session', detail: '' }])
   await $.fs.write(a.cmdFile, rpc.prompt(message) + '\n')
   showStatus($)
+  publish($, a)
 
   const child = $.process.spawn({
     argv: piArgv({ cmdFile: a.cmdFile, session, readOnly: a.readOnly, model: a.model, thinking: a.thinking }),
@@ -319,6 +367,7 @@ async function runPi($: EngineInterface, a: Agent, message: string, signal: Abor
   a.pid = undefined
   stopWatch(a)
   showStatus($)
+  publish($, a)
 }
 
 function answerOf(a: Agent) {
@@ -573,6 +622,34 @@ export const register: Register = on => {
     showStatus($)
     return { result: `${updated ? 'Updated' : 'Started'} watch on ${a.id} every ${intervalS}s; it ends when the agent finishes its turn.` }
   }).catch(($, e, next) => ({ deny: `${$.plugin.name}: the watch request failed.` }))
+
+  // While a pi-backed subagent's transcript is open (↓, from the tasks list), the
+  // band above the prompt shows its latest steps live, in the transcript's colors.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const id = e.props.view.agentId
+    if (!id || e.props.hasSurvey) return next(e)
+    const live = (await $.state.get({ ...LIVE, id })).value
+    if (!live) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const room = Math.max(1, Math.min(LIVE_LINES, e.props.maxRows - 1))
+    const color = live.status === 'running' ? 'suggestion' : live.status === 'completed' ? 'success' : live.status === 'idle' ? 'subtle' : 'error'
+    return (
+      <Box flexDirection="column">
+        <Text wrap="truncate-end">
+          <Text bold>pi</Text> · {live.model ?? "pi's default model"} · <Text color={color}>{live.status}</Text> · {live.steps} tool uses ·{' '}
+          {live.label}
+        </Text>
+        {live.lines.slice(-room).map(line => {
+          const m = LIVE_MARK[line.kind] ?? { mark: '·', color: 'subtle' }
+          return (
+            <Text key={String(line.seq)} wrap="truncate-end">
+              <Text color={m.color}>{m.mark}</Text> {line.text}
+            </Text>
+          )
+        })}
+      </Box>
+    )
+  })
 
   // A watch notice is drawn as one dim line; ctrl+o shows it whole.
   on('ui.render', { component: 'UserMessage' }, ($, e, next) => {

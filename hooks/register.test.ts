@@ -190,6 +190,31 @@ test('a scoped model: pi answers the step, read-only tools for Explore, usage in
   expect(session.appended().some(r => r.agentId === 'a1' && r.message.type === 'system')).toBe(true)
 })
 
+const BAND = { hasSurvey: false, isWorking: false, maxRows: 12, bodyColumns: 100, scroll: { offset: 0, bodyRows: 12 } }
+
+test('the band above the prompt shows the open subagent\'s pi activity, not dimmed', async ($, on) => {
+  const w = world(on)
+  await launch($, w, { subagent_type: 'Explore@codebuddy/deepseek-v4.1-flash' })
+  await step($, 'a1')
+  const ui = await $.ui.mount({ plugin: 'pi-subagent', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, view: { agentId: 'a1' } } })
+  const drawn = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
+  expect(drawn).toContain('completed')
+  expect(drawn).toContain('read {"path":"a.txt"}')
+  expect(drawn).toContain('pi says hi')
+  expect(drawn).not.toContain('do the task')
+  expect((await ui.findAll({ type: 'Text' })).some(t => t.props.dimColor)).toBe(false)
+})
+
+test('the band leaves the main conversation and unknown agents to the engine', async ($, on) => {
+  const w = world(on)
+  await launch($, w, { subagent_type: 'Explore' })
+  await step($, 'a1')
+  for (const view of [{}, { agentId: 'zz' }]) {
+    const ui = await $.ui.mount({ plugin: 'pi-subagent', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, view } }).catch(() => undefined)
+    expect(await ui?.find({ text: 'pi' })).toBeUndefined()
+  }
+})
+
 test('no model named: the default model; effort becomes thinking', async ($, on) => {
   const w = world(on)
   await launch($, w, ({ subagent_type: 'general-purpose', effort: 'high' }))

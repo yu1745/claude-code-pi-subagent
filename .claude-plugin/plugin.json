@@ -1,6 +1,9 @@
 {
   "name": "pi-subagent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "让 Claude Code 的原生子代理用 pi 跑第三方模型（DeepSeek、GLM、Qwen、Gemini…），主代理可纠偏、续接、定期监督",
-  "author": { "name": "wangyu" }
+  "author": {
+    "name": "wangyu"
+  },
+  "types": "./types/index.d.ts"
 }
