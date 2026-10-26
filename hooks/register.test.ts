@@ -30,6 +30,8 @@ type Git = { sessionHead: string; worktreeHead: string; dirty: boolean; resetFai
 type World = {
   // What `$.session.root()` answers; a test may change it once the Agent call is made.
   root: string
+  // The caller's live working directory, what `pwd` answers.
+  cwd: string
   spawns: { argv: readonly string[]; cwd?: string }[]
   runs: (readonly string[])[]
   gitRuns: { argv: readonly string[]; cwd?: string }[]
@@ -52,6 +54,7 @@ const ok = (stdout = '', exitCode = 0) => ({ value: { exitCode, stdout, stderr: 
 function world(on: On, stored?: Record<string, unknown>): World {
   const w: World = {
     root: '/repo',
+    cwd: '/repo',
     spawns: [],
     runs: [],
     gitRuns: [],
@@ -83,7 +86,7 @@ function world(on: On, stored?: Record<string, unknown>): World {
   on('process.run', async ($, e) => {
     w.runs.push(e.argv)
     const [cmd, ...rest] = e.argv
-    if (cmd === 'pwd') return ok('/repo\n')
+    if (cmd === 'pwd') return ok(`${w.cwd}\n`)
     if (cmd === 'pi' && rest[0] === '--list-models') {
       await w.listGate
       return ok(MODELS)
@@ -98,6 +101,10 @@ function world(on: On, stored?: Record<string, unknown>): World {
           ? w.spawned.map(id => `\nworktree /repo/.claude/worktrees/agent-${id}\nHEAD ${w.git.worktreeHead}\nbranch refs/heads/worktree-agent-${id}\n`).join('')
           : ''
         return ok(`worktree /repo\nHEAD ${w.git.sessionHead}\nbranch refs/heads/work\n${linked}`)
+      }
+      if (rest[0] === 'rev-parse' && rest[1] === '--show-toplevel') {
+        const top = /^\/repo\/\.claude\/worktrees\/[^/]+/.exec(cwd ?? '')?.[0] ?? (cwd?.startsWith('/repo') ? '/repo' : undefined)
+        return top ? ok(`${top}\n`) : ok('', 128)
       }
       if (rest[0] === 'rev-parse') return ok(`${inWorktree ? w.git.worktreeHead : w.git.sessionHead}\n`)
       if (rest[0] === 'status') return ok(w.git.dirty ? ' M file.c\n' : '')
@@ -489,6 +496,24 @@ test("the caller's checkout is read at the Agent call, whatever the agent's own 
   w.root = '/repo/.claude/worktrees/agent-a1'
   await step($, 'a1')
   expect(w.gitRuns.find(r => r.argv[0] === 'reset')?.argv).toEqual(['reset', '--hard', 'aaa1111'])
+  expect(promptOf(w)).toContain('do not cd into or edit anything under /repo. ')
+})
+
+test('a session started outside the repo uses the checkout it has cd-ed into', async ($, on) => {
+  const w = world(on)
+  w.root = '/home/u'
+  w.cwd = '/repo/src'
+  await launch($, w, worktreeAgent)
+  await step($, 'a1')
+  expect(w.gitRuns.find(r => r.argv[0] === 'reset')?.argv).toEqual(['reset', '--hard', 'aaa1111'])
+  expect(promptOf(w)).toContain('do not cd into or edit anything under /repo. ')
+})
+
+test('outside any repo the caller\'s checkout falls back to the session root', async ($, on) => {
+  const w = world(on)
+  w.cwd = '/tmp'
+  await launch($, w, worktreeAgent)
+  await step($, 'a1')
   expect(promptOf(w)).toContain('do not cd into or edit anything under /repo. ')
 })
 
