@@ -94,6 +94,17 @@ async function readScope($: EngineInterface): Promise<Scope> {
   return { models, fallback: defaultOf(models, provider, name) }
 }
 
+// The scoped models as pi's settings name them, without pi's facts on each.
+async function scopeNames($: EngineInterface): Promise<Scope> {
+  const { enabled, provider, name } = await readPiSettings($)
+  const models = scopeModels(enabled, [])
+  return { models, fallback: defaultOf(models, provider, name) }
+}
+
+// A cold `pi --list-models` can outlast the engine's 10s budget for tool.describe:
+// past this wait the description names the scoped models without their facts.
+const DESCRIBE_WAIT_MS = 3_000
+
 const ACTIVITY_TOOL = 'mcp__pi-subagent__subagent_activity'
 const WATCH_TOOL = 'mcp__pi-subagent__watch_subagent'
 const WATCH_TAG = '<pi-subagent-watch>'
@@ -611,7 +622,13 @@ export const register: Register = on => {
   on('tool.describe', { tool: 'Agent' }, async ($, e, next) => {
     const described = await next(e)
     scope ??= readScope($)
-    const { models, fallback } = await scope
+    let timer: { cancel: () => void } | undefined
+    const waited = new Promise<undefined>(resolve => {
+      timer = $.clock.after(DESCRIBE_WAIT_MS, () => resolve(undefined))
+    })
+    const ready = await Promise.race([scope, waited])
+    timer?.cancel()
+    const { models, fallback } = ready ?? (await scopeNames($))
     const note = models.length ? scopedNote(models, fallback ?? '') : ANY_MODEL_NOTE
     return { ...described, description: `${described.description}${AGENT_HEAD}\n${note}${AGENT_TAIL}` }
   })

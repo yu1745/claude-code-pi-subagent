@@ -297,6 +297,7 @@ test('scopedNote marks the default and capabilities', () => {
   expect(note).toContain('- zai-coding-cn/glm-5.3 (default) · ctx 1M · out 131.1K · thinking\n')
   expect(note).toContain('glm-5.3-flashx · ctx 1M · out 131.1K · thinking · images')
   expect(note).toContain('any other model is refused')
+  expect(scopedNote(scopeModels(['a/x'], []), '')).toContain('  - a/x\n')
 })
 
 test('piVersionNote: tested, other version, missing', () => {

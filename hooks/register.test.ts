@@ -38,6 +38,8 @@ type World = {
   submitted: string[]
   claudeSteps: number
   spawned: string[]
+  // Holds `pi --list-models` until it settles, like a cold pi.
+  listGate?: Promise<void>
   agentCalls: (Record<string, unknown> & { done?: () => void })[]
   pi: PiScript
 }
@@ -78,11 +80,14 @@ function world(on: On, stored?: Record<string, unknown>): World {
     return { value: undefined }
   })
   on('fs.list', () => ({ value: [...sessionFiles].map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })) }))
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     w.runs.push(e.argv)
     const [cmd, ...rest] = e.argv
     if (cmd === 'pwd') return ok('/repo\n')
-    if (cmd === 'pi' && rest[0] === '--list-models') return ok(MODELS)
+    if (cmd === 'pi' && rest[0] === '--list-models') {
+      await w.listGate
+      return ok(MODELS)
+    }
     if (cmd === 'pi' && rest[0] === '--version') return ok('1.2.0\n')
     if (cmd === 'git') {
       const cwd = e.init?.cwd
@@ -225,6 +230,25 @@ test('describe lists the scoped models with the default marked', async ($, on) =
   expect(d.description).toContain('acme/deepseek-ai/DeepSeek-V4.1-Flash (default)')
   expect(d.description).toContain('codebuddy/deepseek-v4.1-flash (x0.11)')
   expect(d.description).not.toContain('openrouter')
+})
+
+test('a slow pi --list-models: describe names the scoped models, then adds their facts', async ($, on) => {
+  const w = world(on)
+  const clock = mock.clock(on)
+  let release = () => {}
+  w.listGate = new Promise<void>(r => (release = r))
+  const describe = () => $.tool.describe({ tool: 'Agent', description: 'BASE', provider: { plugin: 'engine', tier: 'core' } } as never)
+  const pending = describe()
+  await new Promise(r => setTimeout(r, 20))
+  await clock.advance(3_000)
+  const named = await pending
+  expect(named.description).toContain('- acme/deepseek-ai/DeepSeek-V4.1-Flash (default)\n')
+  expect(named.description).toContain('- codebuddy/deepseek-v4.1-flash (x0.11)\n')
+  expect(named.description).not.toContain('ctx')
+  release()
+  await new Promise(r => setTimeout(r, 20))
+  const full = await describe()
+  expect(full.description).toContain('acme/deepseek-ai/DeepSeek-V4.1-Flash (default) · ctx 1.0M · out 384K')
 })
 
 test('a scoped model: pi answers the step, read-only tools for Explore, usage in the answer', async ($, on) => {

@@ -463,7 +463,7 @@ export const DEFAULT_NOTE =
 export function scopedNote(scoped: readonly ModelInfo[], fallback: string) {
   const rows = scoped.map(
     m =>
-      `  - ${m.id}${m.id === fallback ? ' (default)' : ''} · ctx ${m.context} · out ${m.maxOut}${m.thinking ? ' · thinking' : ''}${m.images ? ' · images' : ''}`,
+      `  - ${m.id}${m.id === fallback ? ' (default)' : ''}${m.context === '?' && m.maxOut === '?' ? '' : ` · ctx ${m.context} · out ${m.maxOut}`}${m.thinking ? ' · thinking' : ''}${m.images ? ' · images' : ''}`,
   )
   return [
     `- Models: subagents run only on these scoped models (append \`@<provider>/<model>\` to subagent_type, optionally \`:<thinking>\`; any other model is refused; omitted, the default):`,
