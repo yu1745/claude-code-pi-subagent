@@ -147,6 +147,7 @@ function world(on: On, stored?: Record<string, unknown>): World {
     return { value: { code: 0, signal: null } }
   })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', ($, e) => ({ text: e.answer }) as never)
   on('prompt.submit', ($, e) => {
     w.submitted.push(e.text)
     return { text: e.text }
@@ -666,7 +667,7 @@ test('SendMessage steers a working agent; otherwise the engine delivers', async 
   expect(JSON.stringify(unknown)).toContain('engine delivered')
 })
 
-test('activity lists and pages; watch notices wake an idle session and join a busy turn', async ($, on) => {
+test('activity lists and pages; watch notices wake an idle session and wait out a busy turn', async ($, on) => {
   const w = world(on)
   const clock = mock.clock(on)
   const session = mock.session(on)
@@ -696,7 +697,11 @@ test('activity lists and pages; watch notices wake an idle session and join a bu
   await clock.advance(30_000)
   await clock.settle()
   expect(w.submitted.length).toBe(before)
-  expect(session.appended().some(r => !r.agentId && JSON.stringify(r.message.content).includes('<pi-subagent-watch>'))).toBe(true)
+  expect(session.appended().some(r => !r.agentId && JSON.stringify(r.message.content).includes('<pi-subagent-watch>'))).toBe(false)
+  // The turn's end delivers what waited, as one prompt.
+  await $.turn.complete({ turnId: 'Tmain', answer: 'CLAUDE' } as never)
+  await clock.settle()
+  expect(w.submitted.length).toBe(before + 1)
 
   const status = await $.tool.call({ tool: 'mcp__pi-subagent__watch_subagent', tool_use_id: 'x5', action: 'status', agent_id: 'watched' } as never)
   expect(JSON.stringify(status)).toContain('Watching a1 every 30s')

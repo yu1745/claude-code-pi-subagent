@@ -168,9 +168,9 @@ const asked = new Map<string, Asked>()
 const agents = new Map<string, Agent>()
 const sections = new Map<string, { text: string; cursor: number }>()
 let delivering = false
-// Whether the main loop is mid-turn: a watch notice then joins the running turn
-// instead of starting one. Every main model request says so again, so a reload
-// mid-turn learns it at the next request.
+// Whether the main loop is mid-turn: a watch notice then waits for the turn to end.
+// Every main model request says so again, so a reload mid-turn learns it at the
+// next request.
 let mainBusy = false
 
 async function subagentDir($: EngineInterface) {
@@ -277,22 +277,19 @@ async function enterWorktree($: EngineInterface, a: Agent): Promise<{ cwd: strin
 
 // Watch notices go to the main agent as one prompt once it is idle; each
 // agent's latest section replaces its earlier undelivered one.
+// Never appended to a running turn: a row added mid-turn lands between that turn's
+// assistant and tool rows, and the history the next turn sends no longer matches the
+// prefix the running turn sent, so the prompt cache is rebuilt from near the top.
 async function flush($: EngineInterface) {
-  if (delivering || !sections.size) return
+  if (delivering || mainBusy || !sections.size) return
   const secs = [...sections.entries()]
   sections.clear()
   delivering = true
   let delivered = false
   try {
     const text = [WATCH_TAG, SUPERVISION_NOTE, ...secs.map(([, s]) => s.text), '</pi-subagent-watch>'].join('\n\n')
-    if (mainBusy) {
-      // The model reads it from the running turn's next request on.
-      const kept = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
-      if (kept.deny !== undefined) throw new Error(kept.deny)
-    } else {
-      const sent = await $.prompt.submit({ text })
-      if (sent.drop !== undefined) throw new Error(sent.drop)
-    }
+    const sent = await $.prompt.submit({ text })
+    if (sent.drop !== undefined) throw new Error(sent.drop)
     delivered = true
     for (const [id, s] of secs) {
       const w = agents.get(id)?.watch
@@ -726,10 +723,7 @@ export const register: Register = on => {
 
   // The agent's model request: pi answers it, and no request is sent.
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId === undefined) {
-      mainBusy = true
-      if (sections.size) void flush($)
-    }
+    if (e.agentId === undefined) mainBusy = true
     const a = e.agentId ? await findKept($, e.agentId) : undefined
     if (!a) return yield* next(e)
     // pi echoes the message as its own user row, which the activity records.

@@ -11,7 +11,7 @@ Claude Code 的一个 mod：**让原生子代理用 [pi](https://pi.dev) 跑第�
 - **停止**：原生 `TaskStop` 会连同 pi 的整个进程树一起停掉。
 - **监督**（第三方模型可能不稳定）：
   - `mcp__pi-subagent__subagent_activity`：读子代理最近的公开活动（文字、工具调用与结果、模型报错和重试），支持游标翻页和单条详情。
-  - `mcp__pi-subagent__watch_subagent`：每隔 N 秒把子代理新增的活动推给主代理；主代理正忙时并入当前这一轮，空闲时唤醒它。
+  - `mcp__pi-subagent__watch_subagent`：每隔 N 秒把子代理新增的活动推给主代理；主代理正忙时攒到这一轮结束再一次送达（不插进进行中的一轮，那样会改写历史前缀、让下一轮的 prompt cache 整体重建），空闲时直接唤醒它。
 - **worktree 隔离**（`isolation: "worktree"`）：引擎默认从 `origin/main` 建 worktree，而不是主会话当前分支。mod 在 pi 第一次启动前，若 worktree 干净，就把它 `reset --hard` 到主会话当前的 HEAD 提交（主会话的仓库在 Agent 调用时记下；主仓里未提交的改动不会带进去）；做不到时（有改动、reset 失败）如实告诉 pi。续接时不再 reset。pi 会被告知 worktree 路径和“别碰主仓、改完在该分支上提交”，答案末尾带 `[worktree · 路径 · branch 分支]`。找不到该 worktree（例如引擎已把无改动的 worktree 清掉）时拒绝运行，**不会回落到别的目录**，答案里说明原因（续接时建议另起一个子代理）。Claude 自己跑的子代理仍用引擎原生的 worktree（基于 origin/main）。
 - **长命令不会被判卡死**：pi 跑一条编译/测试可能几分钟没有任何输出，而引擎对 600 秒没有进展的子代理会判卡死。启动 pi 的包装脚本每 20 秒往 stderr 打一行心跳，pi 有工具在跑时，mod 把它转成一个空的 `thinking` 块交给引擎（只显示、不记录）。pi 没有工具在跑却一直不出声（模型挂住）时不发心跳，照旧 600 秒后被判卡死。
 - **只读类型**：`Explore`、`Plan`、`claude-code-guide` 只给 pi `read,grep,find,ls` 四个工具，改不了文件。
