@@ -317,11 +317,11 @@ function withNotice(content: readonly unknown[], text: string): { content: unkno
   return { content: blocks, id: block.tool_use_id ?? '' }
 }
 
-// One dim line for a notice: who it watched and how many events it brought.
+// The summary line of a notice: who it watched and how many events it brought.
 function noticeLine(text: string) {
   const agentsIn = [...text.matchAll(/^## (\S+) \(([^,)]+)/gm)].map(m => m[2] ?? m[1])
   const events = (text.match(/^\[\d+ /gm) ?? []).length
-  return `⟳ pi watch · ${agentsIn.join(', ') || 'subagents'} · ${events} new events`
+  return `pi watch · ${agentsIn.join(', ') || 'subagents'} · ${events} new events`
 }
 
 // Watch notices go to the main agent: on an idle session as a prompt of its own;
@@ -893,11 +893,15 @@ export const register: Register = on => {
   on('ui.render', { component: 'UserMessage' }, ($, e, next) => {
     if (e.props.isExpanded || e.props.origin.kind !== 'plugin' || !e.props.text.includes(WATCH_TAG)) return next(e)
     const { Text } = $.ui.resolve(e)
-    return <Text dimColor>{noticeLine(e.props.text)} (ctrl+o to expand)</Text>
+    return (
+      <Text>
+        <Text color="suggestion">⏺</Text> {noticeLine(e.props.text)} <Text dimColor>(ctrl+o to expand)</Text>
+      </Text>
+    )
   })
 
   // A notice that rode on a tool result is not in the tool's own output, which the
-  // row draws: it gets a dim line under the result, or under the folded group.
+  // row draws: it gets a summary line under the result, or under the folded group.
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
     const drawn = await next(e)
     const text = rode.get(e.props.tool_use_id)
@@ -906,7 +910,13 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         {drawn}
-        {e.props.isExpanded ? <Text dimColor>{text}</Text> : <Text dimColor>{noticeLine(text)} (ctrl+o to expand)</Text>}
+        {e.props.isExpanded ? (
+          <Text>{text}</Text>
+        ) : (
+          <Text>
+            <Text color="suggestion">⏺</Text> {noticeLine(text)} <Text dimColor>(ctrl+o to expand)</Text>
+          </Text>
+        )}
       </Box>
     )
   })
@@ -922,7 +932,11 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         {drawn}
-        {texts.map(t => <Text dimColor>{noticeLine(t)}</Text>)}
+        {texts.map(t => (
+          <Text>
+            <Text color="suggestion">⏺</Text> {noticeLine(t)}
+          </Text>
+        ))}
       </Box>
     )
   })
