@@ -168,10 +168,12 @@ const asked = new Map<string, Asked>()
 const agents = new Map<string, Agent>()
 const sections = new Map<string, { text: string; cursor: number }>()
 let delivering = false
-// Whether the main loop is mid-turn: a watch notice then waits for the turn to end.
-// Every main model request says so again, so a reload mid-turn learns it at the
-// next request.
+// Whether the main loop is mid-turn: a watch notice then rides on its next tool
+// result. Every main model request says so again, so a reload mid-turn learns it
+// at the next request.
 let mainBusy = false
+// The notices that rode on a tool result, by its tool_use_id, for the transcript to draw.
+const rode = new Map<string, string>()
 
 async function subagentDir($: EngineInterface) {
   return `${(await $.env.get('HOME')) ?? '/tmp'}/.pi/claude-subagents`
@@ -275,33 +277,74 @@ async function enterWorktree($: EngineInterface, a: Agent): Promise<{ cwd: strin
   return { cwd: path, preface: worktreePreface({ path, branch, repo: session, head: subject || head, sessionHead: behind }) }
 }
 
-// Watch notices go to the main agent as one prompt once it is idle; each
-// agent's latest section replaces its earlier undelivered one.
-// Never appended to a running turn: a row added mid-turn lands between that turn's
-// assistant and tool rows, and the history the next turn sends no longer matches the
-// prefix the running turn sent, so the prompt cache is rebuilt from near the top.
+type Section = [string, { text: string; cursor: number }]
+
+function noticeText(secs: Section[]) {
+  return [WATCH_TAG, SUPERVISION_NOTE, ...secs.map(([, s]) => s.text), '</pi-subagent-watch>'].join('\n\n')
+}
+
+function delivered(secs: Section[]) {
+  for (const [id, s] of secs) {
+    const w = agents.get(id)?.watch
+    if (w) w.cursor = Math.max(w.cursor, s.cursor)
+  }
+}
+
+function putBack(secs: Section[]) {
+  for (const [id, s] of secs) if (!sections.has(id)) sections.set(id, s)
+}
+
+// The tool_result blocks of a main-loop row with the notice added to the last one,
+// and that block's tool_use_id. The row is rewritten before it is stored, so the
+// running turn's requests and the history later turns rebuild carry the same bytes.
+// A row of its own (`$.session.append`) is filed wherever the transcript's tail is
+// when it lands, which need not be where the running turn sends it: a request in
+// flight or a response streaming puts it ahead of rows the turn sends before it,
+// the next turn's prefix no longer matches, and the prompt cache is rebuilt from
+// near the top.
+function withNotice(content: readonly unknown[], text: string): { content: unknown[]; id: string } | undefined {
+  const blocks = [...content] as { type: string; tool_use_id?: string; content?: unknown }[]
+  let at = -1
+  for (let i = blocks.length - 1; i >= 0; i--) if (blocks[i]?.type === 'tool_result') { at = i; break }
+  if (at < 0) return undefined
+  const block = blocks[at]!
+  const body = block.content
+  const added = { type: 'text', text }
+  blocks[at] = {
+    ...block,
+    content: typeof body === 'string' ? [{ type: 'text', text: body }, added] : Array.isArray(body) ? [...body, added] : [added],
+  }
+  return { content: blocks, id: block.tool_use_id ?? '' }
+}
+
+// One dim line for a notice: who it watched and how many events it brought.
+function noticeLine(text: string) {
+  const agentsIn = [...text.matchAll(/^## (\S+) \(([^,)]+)/gm)].map(m => m[2] ?? m[1])
+  const events = (text.match(/^\[\d+ /gm) ?? []).length
+  return `⟳ pi watch · ${agentsIn.join(', ') || 'subagents'} · ${events} new events`
+}
+
+// Watch notices go to the main agent: on an idle session as a prompt of its own;
+// mid-turn they wait in `sections` for the main loop's next tool result (the
+// session.append hook). Each agent's latest section replaces its earlier undelivered one.
 async function flush($: EngineInterface) {
   if (delivering || mainBusy || !sections.size) return
   const secs = [...sections.entries()]
   sections.clear()
   delivering = true
-  let delivered = false
+  let sent = false
   try {
-    const text = [WATCH_TAG, SUPERVISION_NOTE, ...secs.map(([, s]) => s.text), '</pi-subagent-watch>'].join('\n\n')
-    const sent = await $.prompt.submit({ text })
-    if (sent.drop !== undefined) throw new Error(sent.drop)
-    delivered = true
-    for (const [id, s] of secs) {
-      const w = agents.get(id)?.watch
-      if (w) w.cursor = Math.max(w.cursor, s.cursor)
-    }
+    const answer = await $.prompt.submit({ text: noticeText(secs) })
+    if (answer.drop !== undefined) throw new Error(answer.drop)
+    sent = true
+    delivered(secs)
   } catch (err) {
     $.ui.log(`pi-subagent: a watch notice was not delivered (${(err as Error).message}); retrying`, { to: 'debug' })
-    for (const [id, s] of secs) if (!sections.has(id)) sections.set(id, s)
+    putBack(secs)
   } finally {
     delivering = false
   }
-  if (!delivered) $.clock.after(10_000, () => void flush($))
+  if (!sent) $.clock.after(10_000, () => void flush($))
   else if (sections.size) void flush($)
 }
 
@@ -696,6 +739,23 @@ export const register: Register = on => {
 
   // What the engine hands the agent to read (its prompt, a resume's message) is pi's next input.
   on('session.append', async ($, e, next) => {
+    // A main-loop tool result carries the watch notices that waited for it.
+    if (!e.agentId && e.door === 'tool-result' && mainBusy && sections.size && !delivering) {
+      const secs = [...sections.entries()]
+      const text = noticeText(secs)
+      const joined = withNotice(e.message.content, text)
+      if (joined) {
+        sections.clear()
+        const stored = await next({ ...e, message: { ...e.message, content: joined.content } as typeof e.message })
+        if (stored.deny !== undefined) putBack(secs)
+        else {
+          delivered(secs)
+          rode.set(joined.id, text)
+          $.ui.invalidate('ui.render')
+        }
+        return stored
+      }
+    }
     const stored = await next(e)
     const toAgent = e.agentId && !stored.deny && e.message.type === 'user' && e.message.role === 'user' && e.door !== 'tool-result' && e.door !== 'note'
     // A resume after a reload appends its message before the agent's step loads it from the store.
@@ -829,16 +889,41 @@ export const register: Register = on => {
     )
   })
 
-  // A watch notice is drawn as one dim line; ctrl+o shows it whole.
+  // A watch notice prompted to an idle session is drawn as one dim line; ctrl+o shows it whole.
   on('ui.render', { component: 'UserMessage' }, ($, e, next) => {
     if (e.props.isExpanded || e.props.origin.kind !== 'plugin' || !e.props.text.includes(WATCH_TAG)) return next(e)
-    const agentsIn = [...e.props.text.matchAll(/^## (\S+) \(([^,)]+)/gm)].map(m => m[2] ?? m[1])
-    const events = (e.props.text.match(/^\[\d+ /gm) ?? []).length
     const { Text } = $.ui.resolve(e)
+    return <Text dimColor>{noticeLine(e.props.text)} (ctrl+o to expand)</Text>
+  })
+
+  // A notice that rode on a tool result is not in the tool's own output, which the
+  // row draws: it gets a dim line under the result, or under the folded group.
+  on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
+    const drawn = await next(e)
+    const text = rode.get(e.props.tool_use_id)
+    if (!text) return drawn
+    const { Box, Text } = $.ui.resolve(e)
     return (
-      <Text dimColor>
-        ⟳ pi watch · {agentsIn.join(', ') || 'subagents'} · {events} new events (ctrl+o to expand)
-      </Text>
+      <Box flexDirection="column">
+        {drawn}
+        {e.props.isExpanded ? <Text dimColor>{text}</Text> : <Text dimColor>{noticeLine(text)} (ctrl+o to expand)</Text>}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
+    const drawn = await next(e)
+    const texts = e.props.calls.flatMap(c => {
+      const text = c.tool_use_id ? rode.get(c.tool_use_id) : undefined
+      return text ? [text] : []
+    })
+    if (!texts.length) return drawn
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column">
+        {drawn}
+        {texts.map(t => <Text dimColor>{noticeLine(t)}</Text>)}
+      </Box>
     )
   })
 }

@@ -667,7 +667,7 @@ test('SendMessage steers a working agent; otherwise the engine delivers', async 
   expect(JSON.stringify(unknown)).toContain('engine delivered')
 })
 
-test('activity lists and pages; watch notices wake an idle session and wait out a busy turn', async ($, on) => {
+test('activity lists and pages; watch notices wake an idle session and ride the next tool result of a busy turn', async ($, on) => {
   const w = world(on)
   const clock = mock.clock(on)
   const session = mock.session(on)
@@ -697,11 +697,19 @@ test('activity lists and pages; watch notices wake an idle session and wait out 
   await clock.advance(30_000)
   await clock.settle()
   expect(w.submitted.length).toBe(before)
+  // No row of its own: it waits for the main loop's next tool result and joins it.
   expect(session.appended().some(r => !r.agentId && JSON.stringify(r.message.content).includes('<pi-subagent-watch>'))).toBe(false)
-  // The turn's end delivers what waited, as one prompt.
-  await $.turn.complete({ turnId: 'Tmain', answer: 'CLAUDE' } as never)
-  await clock.settle()
-  expect(w.submitted.length).toBe(before + 1)
+  await mainToolResult($, 'out')
+  const rows = session.appended().filter(r => !r.agentId && JSON.stringify(r.message.content).includes('<pi-subagent-watch>'))
+  expect(rows.length).toBe(1)
+  const block = rows[0]!.message.content[0] as { type: string; tool_use_id: string; content: { type: string; text: string }[] }
+  expect(block.type).toBe('tool_result')
+  expect(block.tool_use_id).toBe('tu-main')
+  expect(block.content[0]).toEqual({ type: 'text', text: 'out' })
+  expect(block.content[1]?.text).toContain('<pi-subagent-watch>')
+  // Delivered once: a later tool result brings nothing new.
+  await mainToolResult($, 'out2')
+  expect(session.appended().filter(r => !r.agentId && JSON.stringify(r.message.content).includes('<pi-subagent-watch>')).length).toBe(1)
 
   const status = await $.tool.call({ tool: 'mcp__pi-subagent__watch_subagent', tool_use_id: 'x5', action: 'status', agent_id: 'watched' } as never)
   expect(JSON.stringify(status)).toContain('Watching a1 every 30s')
@@ -710,3 +718,13 @@ test('activity lists and pages; watch notices wake an idle session and wait out 
   const done = await $.tool.call({ tool: 'mcp__pi-subagent__watch_subagent', tool_use_id: 'x6', action: 'status', agent_id: 'watched' } as never)
   expect(JSON.stringify(done)).toContain('is not watched (completed)')
 })
+
+
+async function mainToolResult($: any, text: string) {
+  await $.session.append({
+    message: { type: 'user', role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-main', content: text }] },
+    door: 'tool-result',
+    origin: { kind: 'tool', tool: 'Bash' },
+    uuid: `u-${text}`,
+  } as never)
+}
